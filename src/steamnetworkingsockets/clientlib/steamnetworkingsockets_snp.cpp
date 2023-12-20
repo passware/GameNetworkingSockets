@@ -462,10 +462,11 @@ int64 CSteamNetworkConnectionBase::SNP_SendMessage( CSteamNetworkingMessage *pSe
 			if ( usecNextThink > m_senderState.m_messagesQueued.m_pFirst->SNPSend_UsecNagle() )
 			{
 				// It's because of the rate limit
-				SpewDebug( "[%s] Send RATELIM.  QueueTime is %.1fms, SendRate=%.1fk, BytesQueued=%d, ping=%dms\n", 
+				SpewDebug( "[%s] Send RATELIM.  QueueTime is %.1fms, SendRateEst=%.1fk, SendRateUsed=%.1fk, BytesQueued=%d, ping=%dms\n", 
 					GetDescription(),
 					m_sendRateData.CalcTimeUntilNextSend() * 1e-3,
-					m_sendRateData.m_nCurrentSendRateEstimate * ( 1.0/1024.0),
+					m_sendRateData.m_nCurrentSendRateEstimate * ( 1.0/1024.0 ),
+					m_sendRateData.m_flCurrentSendRateUsed * ( 1.0/1024.0 ),
 					m_senderState.PendingBytesTotal(),
 					m_statsEndToEnd.m_ping.m_nSmoothedPing
 				);
@@ -473,11 +474,12 @@ int64 CSteamNetworkConnectionBase::SNP_SendMessage( CSteamNetworkingMessage *pSe
 			else
 			{
 				// Waiting on nagle
-				SpewDebug( "[%s] Send Nagle %.1fms.  QueueTime is %.1fms, SendRate=%.1fk, BytesQueued=%d, ping=%dms\n", 
+				SpewDebug( "[%s] Send Nagle %.1fms.  QueueTime is %.1fms, SendRateEst=%.1fk, SendRateUsed=%.1fk, BytesQueued=%d, ping=%dms\n", 
 					GetDescription(),
 					( m_senderState.m_messagesQueued.m_pFirst->SNPSend_UsecNagle() - usecNow ) * 1e-3,
 					m_sendRateData.CalcTimeUntilNextSend() * 1e-3,
-					m_sendRateData.m_nCurrentSendRateEstimate * ( 1.0/1024.0),
+					m_sendRateData.m_nCurrentSendRateEstimate * ( 1.0/1024.0 ),
+					m_sendRateData.m_flCurrentSendRateUsed * ( 1.0/1024.0 ),
 					m_senderState.PendingBytesTotal(),
 					m_statsEndToEnd.m_ping.m_nSmoothedPing
 				);
@@ -1221,6 +1223,9 @@ bool CSteamNetworkConnectionBase::ProcessPlainTextDataChunk( int usecTimeSinceLa
 					);
 				}
 
+				bool alreadyIncreasedSendRateOnce = false;
+				bool alreadyDecreasedSendRateOnce = false;
+
 				// Process acks first.
 				Assert( nPktNumAckBegin >= 0 );
 				while ( inFlightPkt->first >= nPktNumAckBegin )
@@ -1245,6 +1250,15 @@ bool CSteamNetworkConnectionBase::ProcessPlainTextDataChunk( int usecTimeSinceLa
 							lane.m_cbSentUnackedReliable -= cbSeg;
 
 							relSeg.m_hStatusOrRetry = SNPSendReliableSegment_t::k_nStatus_Acked;
+
+							// No retry is pending for the packet, let's increase our sending rate
+							if( !alreadyIncreasedSendRateOnce )
+							{
+								alreadyIncreasedSendRateOnce = true;
+
+								m_sendRateData.m_nCurrentSendRateEstimate = (int)(m_sendRateData.m_nCurrentSendRateEstimate * 1.05f);
+								SNP_ClampSendRate();
+							}
 						}
 						else if ( relSeg.m_hStatusOrRetry != SNPSendReliableSegment_t::k_nStatus_Acked )
 						{
@@ -1258,6 +1272,14 @@ bool CSteamNetworkConnectionBase::ProcessPlainTextDataChunk( int usecTimeSinceLa
 							lane.m_cbPendingReliable -= cbSeg;
 
 							relSeg.m_hStatusOrRetry = SNPSendReliableSegment_t::k_nStatus_Acked;
+
+							// This might not work really good but, but because of retry we need to decrease send rate in half
+							if( !alreadyDecreasedSendRateOnce )
+							{
+								alreadyDecreasedSendRateOnce = true;
+
+								m_sendRateData.m_nCurrentSendRateEstimate = m_sendRateData.m_nCurrentSendRateEstimate / 2;
+							}
 						}
 
 						// We're about to destroy this SNPInFlightPacket_t, so that
